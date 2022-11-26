@@ -7,6 +7,7 @@
 #include "helpers.h"
 
 #if defined(PLATFORM_ESP32)
+#include <soc/uart_reg.h>
 // UART0 is used since for DupleTX we can connect directly through IO_MUX and not the Matrix
 // for better performance, and on other targets (mostly using pin 13), it always uses Matrix
 HardwareSerial CRSF::Port(0);
@@ -23,6 +24,9 @@ HardwareSerial CRSF::Port(GPIO_PIN_RCSIGNAL_RX, GPIO_PIN_RCSIGNAL_TX);
 #elif defined(STM32F1) || defined(STM32F1xx)
 #include "stm32f1xx_hal.h"
 #include "stm32f1xx_hal_gpio.h"
+#elif defined(STM32F0) || defined(STM32F0xx)
+#include "stm32f0xx_hal.h"
+#include "stm32f0xx_hal_gpio.h"
 #endif
 #elif defined(TARGET_NATIVE)
 HardwareSerial CRSF::Port = Serial;
@@ -76,6 +80,9 @@ uint32_t CRSF::OpenTXsyncLastSent = 0;
 uint32_t CRSF::RequestedRCpacketInterval = 5000; // default to 200hz as per 'normal'
 volatile uint32_t CRSF::RCdataLastRecv = 0;
 volatile int32_t CRSF::OpenTXsyncOffset = 0;
+volatile int32_t CRSF::OpenTXsyncWindow = 0;
+volatile int32_t CRSF::OpenTXsyncWindowSize = 0;
+volatile uint32_t CRSF::dataLastRecv = 0;
 bool CRSF::OpentxSyncActive = true;
 uint32_t CRSF::OpenTXsyncOffsetSafeMargin = 1000; // 100us
 
@@ -157,6 +164,14 @@ void CRSF::Begin()
     USART2->CR1 &= ~USART_CR1_UE;
     USART2->CR2 |= USART_CR2_RXINV | USART_CR2_TXINV; //inverted
     USART2->CR1 |= USART_CR1_UE;
+#endif
+#if defined(TARGET_TX_FLYSKY_FRM301)
+    LL_GPIO_SetPinPull(GPIOA, GPIO_PIN_9, LL_GPIO_PULL_DOWN); // default is PULLUP
+    LL_GPIO_SetPinPull(GPIOA, GPIO_PIN_10, LL_GPIO_PULL_DOWN); // default is PULLUP
+    USART1->CR1 &= ~USART_CR1_UE;
+    USART1->CR3 |= USART_CR3_HDSEL;
+    USART1->CR2 |= USART_CR2_RXINV | USART_CR2_TXINV; //inverted
+    USART1->CR1 |= USART_CR1_UE;
 #endif
     DBGLN("STM32 CRSF UART LISTEN TASK STARTED");
     CRSF::Port.flush();
@@ -292,6 +307,10 @@ void ICACHE_RAM_ATTR CRSF::sendTelemetryToTX(uint8_t *data)
 void ICACHE_RAM_ATTR CRSF::setSyncParams(uint32_t PacketInterval)
 {
     CRSF::RequestedRCpacketInterval = PacketInterval;
+    CRSF::OpenTXsyncOffset = 0;
+    CRSF::OpenTXsyncWindow = 0;
+    CRSF::OpenTXsyncWindowSize = std::max((int32_t)1, (int32_t)(20000/CRSF::RequestedRCpacketInterval));
+    CRSF::OpenTXsyncLastSent -= OpenTXsyncPacketInterval;
     adjustMaxPacketSize();
 }
 
@@ -302,13 +321,28 @@ uint32_t ICACHE_RAM_ATTR CRSF::GetRCdataLastRecv()
 
 void ICACHE_RAM_ATTR CRSF::JustSentRFpacket()
 {
-    CRSF::OpenTXsyncOffset = micros() - CRSF::RCdataLastRecv;
+    // read them in this order to prevent a potential race condition
+    uint32_t last = CRSF::dataLastRecv;
+    uint32_t m = micros();
+    int32_t delta = (int32_t)(m - last);
 
-    if (CRSF::OpenTXsyncOffset > (int32_t)CRSF::RequestedRCpacketInterval) // detect overrun case when the packet arrives too late and caculate negative offsets.
+    if (delta >= (int32_t)CRSF::RequestedRCpacketInterval)
     {
-        CRSF::OpenTXsyncOffset = -(CRSF::OpenTXsyncOffset % CRSF::RequestedRCpacketInterval);
+        // missing/late packet, force resync
+        CRSF::OpenTXsyncOffset = -(delta % CRSF::RequestedRCpacketInterval) * 10;
+        CRSF::OpenTXsyncWindow = 0;
+        CRSF::OpenTXsyncLastSent -= OpenTXsyncPacketInterval;
+#ifdef DEBUG_OPENTX_SYNC
+        DBGLN("Missed packet, forced resync (%d)!", delta);
+#endif
     }
-    //DBGLN("%d, %d", CRSF::OpenTXsyncOffset, CRSF::OpenTXsyncOffsetSafeMargin / 10);
+    else
+    {
+        // The number of packets in the sync window is how many will fit in 20ms.
+        // This gives quite quite coarse changes for 50Hz, but more fine grained changes at 1000Hz.
+        CRSF::OpenTXsyncWindow = std::min(CRSF::OpenTXsyncWindow + 1, (int32_t)CRSF::OpenTXsyncWindowSize);
+        CRSF::OpenTXsyncOffset = ((CRSF::OpenTXsyncOffset * (CRSF::OpenTXsyncWindow-1)) + delta * 10) / CRSF::OpenTXsyncWindow;
+    }
 }
 
 void CRSF::disableOpentxSync()
@@ -327,7 +361,10 @@ void ICACHE_RAM_ATTR CRSF::sendSyncPacketToTX() // in values in us.
     if (CRSF::CRSFstate && (now - OpenTXsyncLastSent) >= OpenTXsyncPacketInterval)
     {
         uint32_t packetRate = CRSF::RequestedRCpacketInterval * 10; //convert from us to right format
-        int32_t offset = CRSF::OpenTXsyncOffset * 10 - CRSF::OpenTXsyncOffsetSafeMargin; // + 400us offset that that opentx always has some headroom
+        int32_t offset = CRSF::OpenTXsyncOffset - CRSF::OpenTXsyncOffsetSafeMargin; // offset so that opentx always has some headroom
+#ifdef DEBUG_OPENTX_SYNC
+        DBGLN("Offset %d", offset); // in 10ths of us (OpenTX sync unit)
+#endif
 
         struct otxSyncData {
             uint8_t extendedType; // CRSF_FRAMETYPE_OPENTX_SYNC
@@ -388,6 +425,8 @@ void ICACHE_RAM_ATTR CRSF::RcPacketToChannelsData() // data is packed as 11 bits
 bool ICACHE_RAM_ATTR CRSF::ProcessPacket()
 {
     bool packetReceived = false;
+
+    CRSF::dataLastRecv = micros();
 
     if (CRSFstate == false)
     {
@@ -646,7 +685,7 @@ void ICACHE_RAM_ATTR CRSF::handleUARTout()
     static uint8_t packageLengthRemaining = 0;
     static uint8_t sendingOffset = 0;
 
-    if (OpentxSyncActive)
+    if (OpentxSyncActive && packageLengthRemaining == 0 && SerialOutFIFO.size() == 0)
     {
         sendSyncPacketToTX(); // calculate mixer sync packet if needed
     }
@@ -868,6 +907,14 @@ bool CRSF::UARTwdt()
             USART2->CR1 &= ~USART_CR1_UE;
             USART2->CR2 |= USART_CR2_RXINV | USART_CR2_TXINV; //inverted
             USART2->CR1 |= USART_CR1_UE;
+#elif defined(TARGET_TX_FLYSKY_FRM301)
+            CRSF::Port.begin(UARTrequestedBaud);
+            LL_GPIO_SetPinPull(GPIOA, GPIO_PIN_9, LL_GPIO_PULL_DOWN); // default is PULLUP
+            LL_GPIO_SetPinPull(GPIOA, GPIO_PIN_10, LL_GPIO_PULL_DOWN); // default is PULLUP
+            USART1->CR1 &= ~USART_CR1_UE;
+            USART1->CR3 |= USART_CR3_HDSEL;
+            USART1->CR2 |= USART_CR2_RXINV | USART_CR2_TXINV; //inverted
+            USART1->CR1 |= USART_CR1_UE;
 #else
             CRSF::Port.begin(UARTrequestedBaud);
 #endif
@@ -877,7 +924,10 @@ bool CRSF::UARTwdt()
 
             retval = true;
         }
-        DBGLN("UART STATS Bad:Good = %u:%u", BadPktsCount, GoodPktsCount);
+#ifdef DEBUG_OPENTX_SYNC
+        if (abs((int)((1000000 / (ExpressLRS_currAirRate_Modparams->interval * ExpressLRS_currAirRate_Modparams->numOfSends)) - (int)GoodPktsCount)) > 1)
+#endif
+            DBGLN("UART STATS Bad:Good = %u:%u", BadPktsCount, GoodPktsCount);
 
         UARTwdtLastChecked = now;
         if (retval)

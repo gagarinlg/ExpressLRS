@@ -426,7 +426,11 @@ int main(void)
   /* MCU Configuration---------------------------------------------*/
 
   /* Make sure the vectors are set correctly */
+  #if defined(STM32F0)
+  __HAL_SYSCFG_REMAPMEMORY_FLASH();
+  #else
   SCB->VTOR = BL_FLASH_START;
+  #endif
 
   /* Reset of all peripherals, Initializes the Flash interface and the
    * Systick.
